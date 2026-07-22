@@ -37,23 +37,60 @@ public partial class SwitcherPlugin : EditorPlugin
         if (scriptsTabContainer != null)
         {
             scriptsTabContainer.TabChanged += OnScriptTabChanged;
-            InitializeHistoryAsync();
         }
 
         switcher = new Switcher
         {
             EditorInterface = EditorInterface.Singleton,
             ScriptsTabContainer = scriptsTabContainer,
-            BaseShKey = baseShKey
+            BaseShKey = baseShKey,
+            Plugin = this
         };
         EditorInterface.Singleton.GetBaseControl().AddChild(switcher);
+
+        InitializeHistoryAsync();
     }
 
     private async void InitializeHistoryAsync()
     {
-        await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
-        await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+        await ToSignal(GetTree().CreateTimer(0.5f), SceneTreeTimer.SignalName.Timeout);
+        PopulateInitialTabs();
         readyForHistory = true;
+    }
+
+    public void PopulateInitialTabs()
+    {
+        // 1. Populate Scenes with correct native icons
+        var openScenes = EditorInterface.Singleton.GetOpenScenes();
+        var sceneIcon = EditorInterface.Singleton.GetEditorTheme().GetIcon("PackedScene", "EditorIcons");
+
+        foreach (var scenePath in openScenes)
+        {
+            if (!string.IsNullOrEmpty(scenePath) && (scenePath.EndsWith(".tscn") || scenePath.EndsWith(".scn")))
+            {
+                AddToHistory(new HistoryItemScene(scenePath, sceneIcon, EditorInterface.Singleton));
+            }
+        }
+
+        // 2. Populate Scripts & Open Text Files (e.g., JSON, Shaders) directly from TabContainer
+        if (scriptsTabContainer != null)
+        {
+            int count = scriptsTabContainer.GetTabCount();
+            for (int i = 0; i < count; i++)
+            {
+                var controlObj = scriptsTabContainer.GetTabControl(i);
+                if (controlObj == null) continue;
+
+                // Skip help/documentation tabs if unwanted
+                if (controlObj.GetClass() == "EditorHelp") continue;
+
+                AddToHistory(new HistoryItemScript(
+                    GodotObject.WeakRef(controlObj),
+                    scriptsTabContainer,
+                    scriptsItemList
+                ));
+            }
+        }
     }
 
     public override void _ExitTree()
@@ -86,16 +123,12 @@ public partial class SwitcherPlugin : EditorPlugin
 
     private void OnSceneChanged(Node node)
     {
-        string path = null;
-        if (node != null)
-        {
-            path = node.SceneFilePath;
-        }
-        if (!string.IsNullOrEmpty(path))
+        string path = node?.SceneFilePath;
+        if (!string.IsNullOrEmpty(path) && (path.EndsWith(".tscn") || path.EndsWith(".scn")))
         {
             AddToHistory(new HistoryItemScene(
                 path,
-                scenesTabBar.GetTabIcon(scenesTabBar.CurrentTab),
+                scenesTabBar?.GetTabIcon(scenesTabBar.CurrentTab),
                 EditorInterface.Singleton
             ));
         }
@@ -123,20 +156,15 @@ public partial class SwitcherPlugin : EditorPlugin
 
     private void OnScriptTabChanged(long idx)
     {
-        if (!readyForHistory) return;
+        if (!readyForHistory || scriptsTabContainer == null) return;
 
         var control = scriptsTabContainer.GetTabControl((int)idx);
-        if (control == lastControl) return;
+        if (control == lastControl || control == null) return;
 
         lastControl = control;
 
-        if (control == null) return;
-
         if (control.GetClass() == "EditorHelp") return;
-
         if (control is not CodeEdit && !control.ToString().Contains("TextEditor")) return;
-
-        GD.Print("Script tab changed, idx: ", idx);
 
         AddToHistory(new HistoryItemScript(
             GodotObject.WeakRef(control),
@@ -190,6 +218,7 @@ public partial class Switcher : AcceptDialog
     public EditorInterface EditorInterface { get; set; }
     public TabContainer ScriptsTabContainer { get; set; }
     public Key BaseShKey { get; set; }
+    public SwitcherPlugin Plugin { get; set; }
 
     private Tree historyTree;
     private TreeItem root;
@@ -280,6 +309,7 @@ public partial class Switcher : AcceptDialog
 
     public void RaiseSwitcher()
     {
+        Plugin?.PopulateInitialTabs();
         PopupCenteredRatio(0.3f);
         Callable.From(() => SetProcessInput(true)).CallDeferred();
         UpdateTree();
@@ -452,8 +482,6 @@ public partial class HistoryItemScene : HistoryItem
         this.scenePath = scenePath;
         this.icon = icon;
         this.editorInterface = editorInterface;
-
-        GD.Print("HistoryItemScene created with path: ", scenePath);
     }
 
     public override bool Equals(object obj)
@@ -478,6 +506,9 @@ public partial class HistoryItemScene : HistoryItem
 
     public override bool IsValid()
     {
+        if (string.IsNullOrEmpty(scenePath)) return false;
+        if (!scenePath.EndsWith(".tscn") && !scenePath.EndsWith(".scn")) return false;
+
         var openScenes = editorInterface.GetOpenScenes();
         foreach (var s in openScenes)
         {
@@ -505,21 +536,11 @@ public partial class HistoryItemScene : HistoryItem
     }
 }
 
-public partial class HistoryItemScript : HistoryItem
+public partial class HistoryItemScript(WeakRef control, TabContainer scriptsTabContainer, ItemList scriptsItemList) : HistoryItem
 {
-    private TabContainer scriptsTabContainer;
-    private ItemList scriptsItemList;
-    private WeakRef control;
-
-    public HistoryItemScript(WeakRef control, TabContainer scriptsTabContainer, ItemList scriptsItemList)
-    {
-        this.control = control;
-        this.scriptsTabContainer = scriptsTabContainer;
-        this.scriptsItemList = scriptsItemList;
-
-        var underlying = control.GetRef().AsGodotObject();
-        GD.Print("HistoryItemScript created with control: ", underlying != null ? underlying.ToString() : "null");
-    }
+    private TabContainer scriptsTabContainer = scriptsTabContainer;
+    private ItemList scriptsItemList = scriptsItemList;
+    private WeakRef control = control;
 
     public override bool Equals(object obj)
     {
@@ -543,13 +564,18 @@ public partial class HistoryItemScript : HistoryItem
     {
         if (control.GetRef().AsGodotObject() is Control controlObj)
         {
-            int tabIdx = scriptsTabContainer.GetTabIdxFromControl(controlObj);
-            int listItemIdx = FindItemListIdxByTabIdx(tabIdx);
-            if (listItemIdx != -1)
+            if (scriptsTabContainer != null)
             {
-                item.SetText(0, scriptsItemList.GetItemText(listItemIdx));
-                item.SetIcon(0, scriptsItemList.GetItemIcon(listItemIdx));
+                int tabIdx = scriptsTabContainer.GetTabIdxFromControl(controlObj);
+                int listItemIdx = FindItemListIdxByTabIdx(tabIdx);
+                if (listItemIdx != -1 && scriptsItemList != null)
+                {
+                    item.SetText(0, scriptsItemList.GetItemText(listItemIdx));
+                    item.SetIcon(0, scriptsItemList.GetItemIcon(listItemIdx));
+                    return;
+                }
             }
+            item.SetText(0, controlObj.Name);
         }
     }
 
@@ -562,15 +588,29 @@ public partial class HistoryItemScript : HistoryItem
     {
         if (control.GetRef().AsGodotObject() is Control controlObj)
         {
-            int tabIdx = scriptsTabContainer.GetTabIdxFromControl(controlObj);
-            int itemIdx = FindItemListIdxByTabIdx(tabIdx);
-            if (itemIdx != -1)
+            if (scriptsTabContainer != null)
             {
-                if (!scriptsItemList.IsSelected(itemIdx))
+                int tabIdx = scriptsTabContainer.GetTabIdxFromControl(controlObj);
+                int itemIdx = FindItemListIdxByTabIdx(tabIdx);
+                if (itemIdx != -1 && scriptsItemList != null)
                 {
-                    scriptsItemList.Select(itemIdx);
-                    scriptsItemList.EmitSignal(ItemList.SignalName.ItemSelected, itemIdx);
+                    if (!scriptsItemList.IsSelected(itemIdx))
+                    {
+                        scriptsItemList.Select(itemIdx);
+                        scriptsItemList.EmitSignal(ItemList.SignalName.ItemSelected, itemIdx);
+                    }
+                    return;
                 }
+                else if (tabIdx != -1)
+                {
+                    scriptsTabContainer.CurrentTab = tabIdx;
+                    return;
+                }
+            }
+
+            if (controlObj.HasMethod("grab_focus"))
+            {
+                controlObj.Call("grab_focus");
             }
         }
     }
@@ -585,14 +625,12 @@ public partial class HistoryItemScript : HistoryItem
         {
             return types.Contains("doc");
         }
-        else
-        {
-            return types.Contains("script");
-        }
+        return types.Contains("script");
     }
 
     private int FindItemListIdxByTabIdx(int tabIdx)
     {
+        if (scriptsItemList == null || tabIdx == -1) return -1;
         for (int i = 0; i < scriptsItemList.ItemCount; i++)
         {
             var metadata = scriptsItemList.GetItemMetadata(i);
